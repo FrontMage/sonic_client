@@ -1,0 +1,9 @@
+[package]
+name = "sonic_client"
+version = "0.1.0"
+authors = ["FrontMage <xbgxwh@outlook.com>"]
+edition = "2018"
+
+[dependencies]
+futures = "0.1.26"
+tokio = "0.1.18"
