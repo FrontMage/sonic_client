@@ -16,7 +16,7 @@ pub struct ControlChan {
     tasks: Arc<Mutex<Vec<Task>>>,
 }
 
-const CLIENT: Token = Token(1);
+const CLIENT: Token = Token(2);
 
 impl ControlChan {
     pub fn new(host: &str, port: usize, password: &str) -> Result<Self, std::io::Error> {

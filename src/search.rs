@@ -87,14 +87,20 @@ impl SearchChan {
                             Ok(_) => {
                                 if line.ends_with("\r\n") {
                                     if line.starts_with("ERR") {
-                                        // TODO: deal error
+                                        let mut t = tasks.lock().unwrap();
+                                        if t.len() > 0 {
+                                            let task = t.remove(0);
+                                            task.sender
+                                                .send(line.clone())
+                                                .expect("Failed to send msg err");
+                                        }
                                     } else if line.starts_with("CONNECTED") {
                                         let mut t = tasks.lock().unwrap();
                                         if t.len() > 0 {
                                             let task = t.remove(0);
                                             task.sender
                                                 .send(line.clone())
-                                                .expect("Failed to send msg");
+                                                .expect("Failed to send msg connected");
                                         }
                                     } else if line.starts_with("STARTED") {
                                         // Do nothing
@@ -106,7 +112,7 @@ impl SearchChan {
                                             .expect("Failed to acquire search_ids lock");
                                         if let Some(sender) = ids.remove(id) {
                                             sender
-                                                .send(tokens[3..].join(" "))
+                                                .send(tokens.join(" "))
                                                 .expect("Failed to send event");
                                         }
                                     } else {
@@ -159,7 +165,7 @@ impl SearchChan {
         terms: &str,
         limit: Option<i32>,
         offset: Option<&str>,
-    ) -> Result<Receiver<String>, std::io::Error> {
+    ) -> Result<Vec<String>, std::io::Error> {
         let (sender, receiver) = self.write(format!(
             "QUERY {} {} {} {} {}\r\n",
             collection,
@@ -182,7 +188,16 @@ impl SearchChan {
                 sender,
             );
         }
-        Ok(receiver)
+        match receiver.recv() {
+            Ok(result) => Ok(result
+                .split(" ")
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to receive from query",
+            )),
+        }
     }
 
     // TODO: check if suggest id conflicts with search
@@ -192,7 +207,7 @@ impl SearchChan {
         bucket: &str,
         word: &str,
         limit: Option<i32>,
-    ) -> Result<Receiver<String>, std::io::Error> {
+    ) -> Result<Vec<String>, std::io::Error> {
         let (sender, receiver) = self.write(format!(
             "SUGGEST {} {} {} {}\r\n",
             collection,
@@ -212,7 +227,16 @@ impl SearchChan {
                 sender,
             );
         }
-        Ok(receiver)
+        match receiver.recv() {
+            Ok(result) => Ok(result
+                .split(" ")
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to receive from suggest",
+            )),
+        }
     }
 
     pub fn ping(&mut self) -> Result<Receiver<String>, std::io::Error> {
@@ -245,7 +269,7 @@ mod test {
             .unwrap();
         let r2 = s.ping().unwrap();
         let r3 = s.quit().unwrap();
-        assert_eq!("\r\n", r1.recv().unwrap());
+        assert_eq!("EVENT", r1[0]);
         assert_eq!("PONG\r\n", r2.recv().unwrap());
         assert_eq!("ENDED quit\r\n", r3.recv().unwrap());
         handle.join().expect("Failed to wait process");
