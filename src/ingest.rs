@@ -1,3 +1,4 @@
+use super::search::Task;
 use mio::net::TcpStream;
 use mio::{Events, PollOpt, Ready, Token};
 use std::collections::HashMap;
@@ -7,55 +8,35 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub struct Task {
-    pub msg: String,
-    pub sender: SyncSender<String>,
-}
-
-impl Task {
-    pub fn new(msg: String) -> (Self, (SyncSender<String>, Receiver<String>)) {
-        let (sender, receiver) = sync_channel::<String>(2);
-        (
-            Task {
-                msg: msg,
-                sender: sender.clone(),
-            },
-            (sender, receiver),
-        )
-    }
-}
-
-pub struct SearchChan {
+pub struct IngestChan {
     host: String,
     port: usize,
     password: String,
     conn: TcpStream,
-    search_ids: Arc<Mutex<HashMap<String, SyncSender<String>>>>,
     tasks: Arc<Mutex<Vec<Task>>>,
 }
 
-const CLIENT: Token = Token(0);
+const CLIENT: Token = Token(1);
 
-impl SearchChan {
+impl IngestChan {
     pub fn new(host: &str, port: usize, password: &str) -> Result<Self, std::io::Error> {
         let stream = TcpStream::connect(
             &format!("{}:{}", host, port)
                 .parse()
                 .expect("Failed to parse socket address"),
         )?;
-        let chan = SearchChan {
+        let chan = IngestChan {
             host: host.clone().into(),
             port: port,
             password: password.clone().into(),
             conn: stream,
-            search_ids: Arc::new(Mutex::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
         };
         Ok(chan)
     }
 
     pub fn connect(&mut self) -> Result<String, std::io::Error> {
-        let msg = format!("START search {}\n", &self.password);
+        let msg = format!("START ingest {}\n", &self.password);
         println!("{}", msg);
         let (task, (_, receiver)) = Task::new(msg.clone());
         {
@@ -71,7 +52,6 @@ impl SearchChan {
     pub fn read(&mut self) -> thread::JoinHandle<()> {
         let conn = self.conn.try_clone().unwrap();
         let tasks = Arc::clone(&self.tasks);
-        let search_ids = Arc::clone(&self.search_ids);
         thread::spawn(move || {
             let poll = mio::Poll::new().unwrap();
             poll.register(&conn, CLIENT, Ready::readable(), PollOpt::edge())
@@ -98,17 +78,6 @@ impl SearchChan {
                                         }
                                     } else if line.starts_with("STARTED") {
                                         // Do nothing
-                                    } else if line.starts_with("EVENT") {
-                                        let tokens = line.split(" ").collect::<Vec<&str>>();
-                                        let id = tokens[2];
-                                        let mut ids = search_ids
-                                            .lock()
-                                            .expect("Failed to acquire search_ids lock");
-                                        if let Some(sender) = ids.remove(id) {
-                                            sender
-                                                .send(tokens[3..].join(" "))
-                                                .expect("Failed to send event");
-                                        }
                                     } else {
                                         let mut t = tasks.lock().unwrap();
                                         if t.len() > 0 {
@@ -152,66 +121,80 @@ impl SearchChan {
         Ok((sender.clone(), receiver))
     }
 
-    pub fn query(
+    pub fn push(
         &mut self,
         collection: &str,
         bucket: &str,
-        terms: &str,
-        limit: Option<i32>,
-        offset: Option<&str>,
+        object: &str,
+        text: &str,
+        lang: Option<&str>,
     ) -> Result<Receiver<String>, std::io::Error> {
-        let (sender, receiver) = self.write(format!(
-            "QUERY {} {} {} {} {}\r\n",
+        let (_, receiver) = self.write(format!(
+            "PUSH {} {} {} {} {}\r\n",
             collection,
             bucket,
-            format!("\"{}\"", terms),
-            limit
-                .and_then(|l| Some(format!("LIMIT({})", l)))
-                .unwrap_or("".to_string()),
-            offset
-                .and_then(|l| Some(format!("OFFSET({})", l)))
+            object,
+            format!("\"{}\"", text),
+            lang.and_then(|l| Some(format!("LANG({})", l)))
                 .unwrap_or("".to_string()),
         ))?;
-        if let Ok(id) = receiver.recv() {
-            let mut search_ids = self
-                .search_ids
-                .lock()
-                .expect("Failed to acquire search_id lock");
-            search_ids.insert(
-                id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
-                sender,
-            );
-        }
         Ok(receiver)
     }
 
-    // TODO: check if suggest id conflicts with search
-    pub fn suggest(
+    pub fn pop(
         &mut self,
         collection: &str,
         bucket: &str,
-        word: &str,
-        limit: Option<i32>,
+        object: &str,
+        text: &str,
     ) -> Result<Receiver<String>, std::io::Error> {
-        let (sender, receiver) = self.write(format!(
-            "SUGGEST {} {} {} {}\r\n",
+        let (_, receiver) = self.write(format!(
+            "POP {} {} {} {}\r\n",
             collection,
             bucket,
-            format!("\"{}\"", word),
-            limit
-                .and_then(|l| Some(format!("LIMIT({})", l)))
-                .unwrap_or("".to_string()),
+            object,
+            format!("\"{}\"", text),
         ))?;
-        if let Ok(id) = receiver.recv() {
-            let mut search_ids = self
-                .search_ids
-                .lock()
-                .expect("Failed to acquire search_id lock");
-            search_ids.insert(
-                id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
-                sender,
-            );
-        }
+        Ok(receiver)
+    }
+
+    pub fn count(
+        &mut self,
+        collection: &str,
+        bucket: Option<&str>,
+        object: Option<&str>,
+    ) -> Result<Receiver<String>, std::io::Error> {
+        let (_, receiver) = self.write(format!(
+            "COUNT {} {} {}\r\n",
+            collection,
+            bucket.unwrap_or(""),
+            object.unwrap_or(""),
+        ))?;
+        Ok(receiver)
+    }
+
+    pub fn flushc(&mut self, collection: &str) -> Result<Receiver<String>, std::io::Error> {
+        let (_, receiver) = self.write(format!("FLUSHC {}\r\n", collection,))?;
+        Ok(receiver)
+    }
+
+    pub fn flushb(
+        &mut self,
+        collection: &str,
+        bucket: &str,
+    ) -> Result<Receiver<String>, std::io::Error> {
+        let (_, receiver) = self.write(format!("FLUSHB {} {}\r\n", collection, bucket))?;
+        Ok(receiver)
+    }
+
+    pub fn flusho(
+        &mut self,
+        collection: &str,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Receiver<String>, std::io::Error> {
+        let (_, receiver) =
+            self.write(format!("FLUSHO {} {} {}\r\n", collection, bucket, object))?;
         Ok(receiver)
     }
 
@@ -236,16 +219,22 @@ mod test {
     use std::time;
     #[test]
     fn test_search() {
-        let mut s = SearchChan::new("127.0.0.1", 1491, "haha").expect("Connection error");
+        let mut s = IngestChan::new("127.0.0.1", 1491, "haha").expect("Connection error");
         let handle = s.read();
         assert_eq!("CONNECTED <sonic-server v1.1.8>\r\n", s.connect().unwrap());
         thread::sleep(time::Duration::from_secs(4));
         let r1 = s
-            .query("helpdesk", "user:0dcde3a6", "gdpr", Some(50), None)
+            .push(
+                "messages",
+                "user:0dcde3a6",
+                "conversation:71f3d63b",
+                "Hey Valerian",
+                None,
+            )
             .unwrap();
         let r2 = s.ping().unwrap();
         let r3 = s.quit().unwrap();
-        assert_eq!("\r\n", r1.recv().unwrap());
+        assert_eq!("OK\r\n", r1.recv().unwrap());
         assert_eq!("PONG\r\n", r2.recv().unwrap());
         assert_eq!("ENDED quit\r\n", r3.recv().unwrap());
         handle.join().expect("Failed to wait process");
