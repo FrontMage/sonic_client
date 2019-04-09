@@ -8,6 +8,10 @@ This lib is under development, apis could change very fast.
 
 ## Usage
 
+```toml
+sonic_client = "0.1.1"
+```
+
 ```rust
 use sonic_client::SearchChan;
 
