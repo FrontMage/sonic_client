@@ -2,12 +2,11 @@
 name = "sonic_client"
 version = "0.1.0"
 authors = ["FrontMage <xbgxwh@outlook.com>"]
-edition = "2019"
 readme = "./README.md"
 keywords = ["sonic", "client"]
 categories = ["lib"]
 license = "GPL"
-appveyor = { repository = "https://github.com/FrontMage/sonic_client" branch = "master", service = "github" }
+appveyor = { repository = "https://github.com/FrontMage/sonic_client", branch = "master", service = "github" }
 
 [dependencies]
 mio = "0.6.16"
