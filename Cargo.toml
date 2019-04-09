@@ -7,6 +7,7 @@ keywords = ["sonic", "client"]
 categories = ["lib"]
 license = "GPL"
 appveyor = { repository = "https://github.com/FrontMage/sonic_client", branch = "master", service = "github" }
+description = "a client lib for sonic search"
 
 [dependencies]
 mio = "0.6.16"
