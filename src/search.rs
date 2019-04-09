@@ -1,4 +1,3 @@
-extern crate mio;
 use mio::net::TcpStream;
 use mio::{Events, PollOpt, Ready, Token};
 use std::collections::HashMap;
