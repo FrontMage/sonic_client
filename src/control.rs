@@ -1,10 +1,9 @@
 use super::search::Task;
 use mio::net::TcpStream;
 use mio::{Events, PollOpt, Ready, Token};
-use std::collections::HashMap;
 use std::io::prelude::*;
-use std::io::{BufReader, BufWriter};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::io::{BufReader, BufWriter, Error, ErrorKind};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -19,7 +18,7 @@ pub struct ControlChan {
 const CLIENT: Token = Token(2);
 
 impl ControlChan {
-    pub fn new(host: &str, port: usize, password: &str) -> Result<Self, std::io::Error> {
+    pub fn new(host: &str, port: usize, password: &str) -> Result<Self, Error> {
         let stream = TcpStream::connect(
             &format!("{}:{}", host, port)
                 .parse()
@@ -35,9 +34,8 @@ impl ControlChan {
         Ok(chan)
     }
 
-    pub fn connect(&mut self) -> Result<String, std::io::Error> {
+    pub fn connect(&mut self) -> Result<String, Error> {
         let msg = format!("START control {}\n", &self.password);
-        println!("{}", msg);
         let (task, (_, receiver)) = Task::new(msg.clone());
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
@@ -46,7 +44,7 @@ impl ControlChan {
         let conn = self.conn.try_clone()?;
         let mut writer = BufWriter::new(conn);
         writer.write_all(msg.as_bytes())?;
-        Ok(receiver.recv().unwrap_or("".to_string()))
+        receiver.recv().unwrap_or(Ok("".to_string()))
     }
 
     pub fn read(&mut self) -> thread::JoinHandle<()> {
@@ -73,7 +71,7 @@ impl ControlChan {
                                         if t.len() > 0 {
                                             let task = t.remove(0);
                                             task.sender
-                                                .send(line.clone())
+                                                .send(Ok(line.clone()))
                                                 .expect("Failed to send msg");
                                         }
                                     } else if line.starts_with("STARTED") {
@@ -83,7 +81,7 @@ impl ControlChan {
                                         if t.len() > 0 {
                                             let task = t.remove(0);
                                             task.sender
-                                                .send(line.clone())
+                                                .send(Ok(line.clone()))
                                                 .expect("Failed to send msg");
                                         }
                                     }
@@ -94,7 +92,7 @@ impl ControlChan {
                                 }
                             }
                             Err(e) => {
-                                if e.kind() != std::io::ErrorKind::WouldBlock {
+                                if e.kind() != ErrorKind::WouldBlock {
                                     println!("{:?}", e);
                                 }
                             }
@@ -109,7 +107,13 @@ impl ControlChan {
     pub fn write(
         &mut self,
         msg: String,
-    ) -> Result<(SyncSender<String>, Receiver<String>), std::io::Error> {
+    ) -> Result<
+        (
+            SyncSender<Result<String, Error>>,
+            Receiver<Result<String, Error>>,
+        ),
+        Error,
+    > {
         let (task, (sender, receiver)) = Task::new(msg.clone());
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
@@ -121,22 +125,25 @@ impl ControlChan {
         Ok((sender.clone(), receiver))
     }
 
-    pub fn trigger(&mut self, action: Option<&str>) -> Result<Receiver<String>, std::io::Error> {
+    pub fn trigger(
+        &mut self,
+        action: Option<&str>,
+    ) -> Result<Receiver<Result<String, Error>>, Error> {
         let (_, receiver) = self.write(format!("TRIGGER {}\r\n", action.unwrap_or("")))?;
         Ok(receiver)
     }
 
-    pub fn ping(&mut self) -> Result<Receiver<String>, std::io::Error> {
+    pub fn ping(&mut self) -> Result<Receiver<Result<String, Error>>, Error> {
         let (_, receiver) = self.write("PING\r\n".to_string())?;
         Ok(receiver)
     }
 
-    pub fn quit(&mut self) -> Result<Receiver<String>, std::io::Error> {
+    pub fn quit(&mut self) -> Result<Receiver<Result<String, Error>>, Error> {
         let (_, receiver) = self.write("QUIT\r\n".to_string())?;
         Ok(receiver)
     }
 
-    pub fn help(&mut self, manual: Option<&str>) -> Result<Receiver<String>, std::io::Error> {
+    pub fn help(&mut self, manual: Option<&str>) -> Result<Receiver<Result<String, Error>>, Error> {
         let (_, receiver) = self.write(format!("HELP {}\r\n", manual.unwrap_or("")))?;
         Ok(receiver)
     }
@@ -153,8 +160,8 @@ mod test {
         thread::sleep(time::Duration::from_secs(4));
         let r2 = s.ping().unwrap();
         let r3 = s.quit().unwrap();
-        assert_eq!("PONG\r\n", r2.recv().unwrap());
-        assert_eq!("ENDED quit\r\n", r3.recv().unwrap());
+        assert_eq!("PONG\r\n", r2.recv().unwrap().unwrap());
+        assert_eq!("ENDED quit\r\n", r3.recv().unwrap().unwrap());
         handle.join().expect("Failed to wait process");
     }
 }

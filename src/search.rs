@@ -2,19 +2,27 @@ use mio::net::TcpStream;
 use mio::{Events, PollOpt, Ready, Token};
 use std::collections::HashMap;
 use std::io::prelude::*;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Error, ErrorKind};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub struct Task {
     pub msg: String,
-    pub sender: SyncSender<String>,
+    pub sender: SyncSender<Result<String, Error>>,
 }
 
 impl Task {
-    pub fn new(msg: String) -> (Self, (SyncSender<String>, Receiver<String>)) {
-        let (sender, receiver) = sync_channel::<String>(2);
+    pub fn new(
+        msg: String,
+    ) -> (
+        Self,
+        (
+            SyncSender<Result<String, Error>>,
+            Receiver<Result<String, Error>>,
+        ),
+    ) {
+        let (sender, receiver) = sync_channel::<Result<String, Error>>(2);
         (
             Task {
                 msg: msg,
@@ -30,14 +38,14 @@ pub struct SearchChan {
     port: usize,
     password: String,
     conn: TcpStream,
-    search_ids: Arc<Mutex<HashMap<String, SyncSender<String>>>>,
+    search_ids: Arc<Mutex<HashMap<String, SyncSender<Result<String, Error>>>>>,
     tasks: Arc<Mutex<Vec<Task>>>,
 }
 
 const CLIENT: Token = Token(0);
 
 impl SearchChan {
-    pub fn new(host: &str, port: usize, password: &str) -> Result<Self, std::io::Error> {
+    pub fn new(host: &str, port: usize, password: &str) -> Result<Self, Error> {
         let stream = TcpStream::connect(
             &format!("{}:{}", host, port)
                 .parse()
@@ -54,9 +62,8 @@ impl SearchChan {
         Ok(chan)
     }
 
-    pub fn connect(&mut self) -> Result<String, std::io::Error> {
+    pub fn connect(&mut self) -> Result<String, Error> {
         let msg = format!("START search {}\n", &self.password);
-        println!("{}", msg);
         let (task, (_, receiver)) = Task::new(msg.clone());
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
@@ -65,7 +72,10 @@ impl SearchChan {
         let conn = self.conn.try_clone()?;
         let mut writer = BufWriter::new(conn);
         writer.write_all(msg.as_bytes())?;
-        Ok(receiver.recv().unwrap_or("".to_string()))
+        receiver
+            .recv()
+            .or_else(|e| Err(Error::new(ErrorKind::Other, format!("{:?}", e))))
+            .unwrap()
     }
 
     pub fn read(&mut self) -> thread::JoinHandle<()> {
@@ -91,7 +101,7 @@ impl SearchChan {
                                         if t.len() > 0 {
                                             let task = t.remove(0);
                                             task.sender
-                                                .send(line.clone())
+                                                .send(Ok(line.clone()))
                                                 .expect("Failed to send msg err");
                                         }
                                     } else if line.starts_with("CONNECTED") {
@@ -99,11 +109,11 @@ impl SearchChan {
                                         if t.len() > 0 {
                                             let task = t.remove(0);
                                             task.sender
-                                                .send(line.clone())
+                                                .send(Ok(line.clone()))
                                                 .expect("Failed to send msg connected");
                                         }
                                     } else if line.starts_with("STARTED") {
-                                        // Do nothing
+                                        // Do nothing, connection is started after CONNECTED
                                     } else if line.starts_with("EVENT") {
                                         let tokens = line.split(" ").collect::<Vec<&str>>();
                                         let id = tokens[2];
@@ -112,7 +122,7 @@ impl SearchChan {
                                             .expect("Failed to acquire search_ids lock");
                                         if let Some(sender) = ids.remove(id) {
                                             sender
-                                                .send(tokens.join(" "))
+                                                .send(Ok(tokens.join(" ")))
                                                 .expect("Failed to send event");
                                         }
                                     } else {
@@ -120,7 +130,7 @@ impl SearchChan {
                                         if t.len() > 0 {
                                             let task = t.remove(0);
                                             task.sender
-                                                .send(line.clone())
+                                                .send(Ok(line.clone()))
                                                 .expect("Failed to send msg");
                                         }
                                     }
@@ -131,7 +141,7 @@ impl SearchChan {
                                 }
                             }
                             Err(e) => {
-                                if e.kind() != std::io::ErrorKind::WouldBlock {
+                                if e.kind() != ErrorKind::WouldBlock {
                                     println!("{:?}", e);
                                 }
                             }
@@ -146,7 +156,13 @@ impl SearchChan {
     pub fn write(
         &mut self,
         msg: String,
-    ) -> Result<(SyncSender<String>, Receiver<String>), std::io::Error> {
+    ) -> Result<
+        (
+            SyncSender<Result<String, Error>>,
+            Receiver<Result<String, Error>>,
+        ),
+        Error,
+    > {
         let (task, (sender, receiver)) = Task::new(msg.clone());
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
@@ -165,7 +181,7 @@ impl SearchChan {
         terms: &str,
         limit: Option<i32>,
         offset: Option<&str>,
-    ) -> Result<Vec<String>, std::io::Error> {
+    ) -> Result<Vec<String>, Error> {
         let (sender, receiver) = self.write(format!(
             "QUERY {} {} {} {} {}\r\n",
             collection,
@@ -178,25 +194,27 @@ impl SearchChan {
                 .and_then(|l| Some(format!("OFFSET({})", l)))
                 .unwrap_or("".to_string()),
         ))?;
-        if let Ok(id) = receiver.recv() {
-            let mut search_ids = self
-                .search_ids
-                .lock()
-                .expect("Failed to acquire search_id lock");
-            search_ids.insert(
-                id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
-                sender,
-            );
+        if let Ok(res) = receiver.recv() {
+            if let Ok(id) = res {
+                let mut search_ids = self
+                    .search_ids
+                    .lock()
+                    .expect("Failed to acquire search_id lock");
+                search_ids.insert(
+                    id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
+                    sender,
+                );
+            }
         }
         match receiver.recv() {
-            Ok(result) => Ok(result
-                .split(" ")
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>()),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to receive from query",
-            )),
+            Ok(result) => match result {
+                Ok(res) => Ok(res
+                    .split(" ")
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()),
+                Err(e) => Err(e),
+            },
+            Err(_) => Err(Error::new(ErrorKind::Other, "Failed to receive from query")),
         }
     }
 
@@ -207,7 +225,7 @@ impl SearchChan {
         bucket: &str,
         word: &str,
         limit: Option<i32>,
-    ) -> Result<Vec<String>, std::io::Error> {
+    ) -> Result<Vec<String>, Error> {
         let (sender, receiver) = self.write(format!(
             "SUGGEST {} {} {} {}\r\n",
             collection,
@@ -217,41 +235,52 @@ impl SearchChan {
                 .and_then(|l| Some(format!("LIMIT({})", l)))
                 .unwrap_or("".to_string()),
         ))?;
-        if let Ok(id) = receiver.recv() {
-            let mut search_ids = self
-                .search_ids
-                .lock()
-                .expect("Failed to acquire search_id lock");
-            search_ids.insert(
-                id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
-                sender,
-            );
+        if let Ok(res) = receiver.recv() {
+            if let Ok(id) = res {
+                let mut search_ids = self
+                    .search_ids
+                    .lock()
+                    .expect("Failed to acquire search_id lock");
+                search_ids.insert(
+                    id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
+                    sender,
+                );
+            }
         }
         match receiver.recv() {
-            Ok(result) => Ok(result
-                .split(" ")
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>()),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to receive from suggest",
-            )),
+            Ok(result) => match result {
+                Ok(res) => Ok(res
+                    .split(" ")
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()),
+                Err(e) => Err(e),
+            },
+            Err(_) => Err(Error::new(ErrorKind::Other, "Failed to receive from query")),
         }
     }
 
-    pub fn ping(&mut self) -> Result<Receiver<String>, std::io::Error> {
+    pub fn ping(&mut self) -> Result<String, Error> {
         let (_, receiver) = self.write("PING\r\n".to_string())?;
-        Ok(receiver)
+        receiver
+            .recv()
+            .or_else(|e| Err(Error::new(ErrorKind::Other, format!("{:?}", e))))
+            .unwrap()
     }
 
-    pub fn quit(&mut self) -> Result<Receiver<String>, std::io::Error> {
+    pub fn quit(&mut self) -> Result<String, Error> {
         let (_, receiver) = self.write("QUIT\r\n".to_string())?;
-        Ok(receiver)
+        receiver
+            .recv()
+            .or_else(|e| Err(Error::new(ErrorKind::Other, format!("{:?}", e))))
+            .unwrap()
     }
 
-    pub fn help(&mut self, manual: Option<&str>) -> Result<Receiver<String>, std::io::Error> {
+    pub fn help(&mut self, manual: Option<&str>) -> Result<String, Error> {
         let (_, receiver) = self.write(format!("HELP {}\r\n", manual.unwrap_or("")))?;
-        Ok(receiver)
+        receiver
+            .recv()
+            .or_else(|e| Err(Error::new(ErrorKind::Other, format!("{:?}", e))))
+            .unwrap()
     }
 }
 
@@ -267,11 +296,11 @@ mod test {
         let r1 = s
             .query("helpdesk", "user:0dcde3a6", "gdpr", Some(50), None)
             .unwrap();
-        let r2 = s.ping().unwrap();
-        let r3 = s.quit().unwrap();
+        let r2 = s.ping();
+        let r3 = s.quit();
         assert_eq!("EVENT", r1[0]);
-        assert_eq!("PONG\r\n", r2.recv().unwrap());
-        assert_eq!("ENDED quit\r\n", r3.recv().unwrap());
+        assert_eq!("PONG\r\n", r2.unwrap());
+        assert_eq!("ENDED quit\r\n", r3.unwrap());
         handle.join().expect("Failed to wait process");
     }
 }
