@@ -5,9 +5,10 @@ authors = ["FrontMage <xbgxwh@outlook.com>"]
 readme = "./README.md"
 keywords = ["sonic", "client"]
 categories = ["lib"]
-license = "GPL"
+license = "MPL-2.0"
 appveyor = { repository = "https://github.com/FrontMage/sonic_client", branch = "master", service = "github" }
 description = "a client lib for sonic search"
+edition = "2018"
 
 [dependencies]
 mio = "0.6.16"
