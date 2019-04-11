@@ -3,6 +3,7 @@ use mio::net::TcpStream;
 use mio::{Events, PollOpt, Ready, Token};
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter, Error, ErrorKind};
+use std::mem::drop;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -40,6 +41,7 @@ impl IngestChan {
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
             t.push(task);
+            drop(t);
         }
         let conn = self.conn.try_clone()?;
         let mut writer = BufWriter::new(conn);
@@ -74,6 +76,7 @@ impl IngestChan {
                                                 .send(Ok(line.clone()))
                                                 .expect("Failed to send msg");
                                         }
+                                        drop(t);
                                     } else if line.starts_with("STARTED") {
                                         // Do nothing
                                     } else {
@@ -84,6 +87,7 @@ impl IngestChan {
                                                 .send(Ok(line.clone()))
                                                 .expect("Failed to send msg");
                                         }
+                                        drop(t);
                                     }
                                     if line.starts_with("ENDED") {
                                         break 'event_loop;
@@ -118,6 +122,7 @@ impl IngestChan {
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
             t.push(task);
+            drop(t);
         }
         let conn = self.conn.try_clone()?;
         let mut writer = BufWriter::new(conn);

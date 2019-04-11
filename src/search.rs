@@ -3,6 +3,7 @@ use mio::{Events, PollOpt, Ready, Token};
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter, Error, ErrorKind};
+use std::mem::drop;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -68,6 +69,7 @@ impl SearchChan {
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
             t.push(task);
+            drop(t);
         }
         let conn = self.conn.try_clone()?;
         let mut writer = BufWriter::new(conn);
@@ -104,6 +106,7 @@ impl SearchChan {
                                                 .send(Ok(line.clone()))
                                                 .expect("Failed to send msg err");
                                         }
+                                        drop(t);
                                     } else if line.starts_with("CONNECTED") {
                                         let mut t = tasks.lock().unwrap();
                                         if t.len() > 0 {
@@ -112,6 +115,7 @@ impl SearchChan {
                                                 .send(Ok(line.clone()))
                                                 .expect("Failed to send msg connected");
                                         }
+                                        drop(t);
                                     } else if line.starts_with("STARTED") {
                                         // Do nothing, connection is started after CONNECTED
                                     } else if line.starts_with("EVENT") {
@@ -125,6 +129,7 @@ impl SearchChan {
                                                 .send(Ok(tokens.join(" ")))
                                                 .expect("Failed to send event");
                                         }
+                                        drop(ids);
                                     } else {
                                         let mut t = tasks.lock().unwrap();
                                         if t.len() > 0 {
@@ -133,6 +138,7 @@ impl SearchChan {
                                                 .send(Ok(line.clone()))
                                                 .expect("Failed to send msg");
                                         }
+                                        drop(t);
                                     }
                                     if line.starts_with("ENDED") {
                                         break 'event_loop;
@@ -167,6 +173,7 @@ impl SearchChan {
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
             t.push(task);
+            drop(t);
         }
         let conn = self.conn.try_clone()?;
         let mut writer = BufWriter::new(conn);
@@ -204,6 +211,7 @@ impl SearchChan {
                     id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
                     sender,
                 );
+                drop(search_ids);
             }
         }
         match receiver.recv() {
@@ -218,7 +226,6 @@ impl SearchChan {
         }
     }
 
-    // TODO: check if suggest id conflicts with search
     pub fn suggest(
         &mut self,
         collection: &str,
@@ -245,6 +252,7 @@ impl SearchChan {
                     id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
                     sender,
                 );
+                drop(search_ids);
             }
         }
         match receiver.recv() {
