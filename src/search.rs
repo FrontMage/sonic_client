@@ -41,6 +41,7 @@ pub struct SearchChan {
     conn: TcpStream,
     search_ids: Arc<Mutex<HashMap<String, SyncSender<Result<String, Error>>>>>,
     tasks: Arc<Mutex<Vec<Task>>>,
+    debugging: bool,
 }
 
 const CLIENT: Token = Token(0);
@@ -59,31 +60,29 @@ impl SearchChan {
             conn: stream,
             search_ids: Arc::new(Mutex::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            debugging: false,
         };
         Ok(chan)
     }
 
     pub fn connect(&mut self) -> Result<String, Error> {
         let msg = format!("START search {}\n", &self.password);
-        let (task, (_, receiver)) = Task::new(msg.clone());
-        {
-            let mut t = self.tasks.lock().expect("Failed to acquire task lock");
-            t.push(task);
-            drop(t);
-        }
-        let conn = self.conn.try_clone()?;
-        let mut writer = BufWriter::new(conn);
-        writer.write_all(msg.as_bytes())?;
+        let (_, receiver) = self.write(msg)?;
         receiver
             .recv()
             .or_else(|e| Err(Error::new(ErrorKind::Other, format!("{:?}", e))))
             .unwrap()
     }
 
+    pub fn debug(&mut self) {
+        self.debugging = true;
+    }
+
     pub fn read(&mut self) -> thread::JoinHandle<()> {
         let conn = self.conn.try_clone().unwrap();
         let tasks = Arc::clone(&self.tasks);
         let search_ids = Arc::clone(&self.search_ids);
+        let is_debugging = Arc::new(self.debugging);
         thread::spawn(move || {
             let poll = mio::Poll::new().unwrap();
             poll.register(&conn, CLIENT, Ready::readable(), PollOpt::edge())
@@ -97,6 +96,9 @@ impl SearchChan {
                     match event.token() {
                         CLIENT => match reader.read_line(&mut line) {
                             Ok(_) => {
+                                if *is_debugging {
+                                    println!("Read: {}", line);
+                                }
                                 if line.ends_with("\r\n") {
                                     if line.starts_with("ERR") {
                                         let mut t = tasks.lock().unwrap();
@@ -169,6 +171,9 @@ impl SearchChan {
         ),
         Error,
     > {
+        if self.debugging {
+            println!("Write: {}", msg);
+        }
         let (task, (sender, receiver)) = Task::new(msg.clone());
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
@@ -298,6 +303,7 @@ mod test {
     #[test]
     fn test_search() {
         let mut s = SearchChan::new("127.0.0.1", 1491, "haha").expect("Connection error");
+        s.debug();
         let handle = s.read();
         assert_eq!("CONNECTED <sonic-server v1.1.8>\r\n", s.connect().unwrap());
         thread::sleep(time::Duration::from_secs(4));

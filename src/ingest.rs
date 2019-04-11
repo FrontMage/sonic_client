@@ -14,6 +14,7 @@ pub struct IngestChan {
     password: String,
     conn: TcpStream,
     tasks: Arc<Mutex<Vec<Task>>>,
+    debugging: bool,
 }
 
 const CLIENT: Token = Token(1);
@@ -31,27 +32,25 @@ impl IngestChan {
             password: password.clone().into(),
             conn: stream,
             tasks: Arc::new(Mutex::new(Vec::new())),
+            debugging: false,
         };
         Ok(chan)
     }
 
     pub fn connect(&mut self) -> Result<String, Error> {
         let msg = format!("START ingest {}\n", &self.password);
-        let (task, (_, receiver)) = Task::new(msg.clone());
-        {
-            let mut t = self.tasks.lock().expect("Failed to acquire task lock");
-            t.push(task);
-            drop(t);
-        }
-        let conn = self.conn.try_clone()?;
-        let mut writer = BufWriter::new(conn);
-        writer.write_all(msg.as_bytes())?;
+        let (_, receiver) = self.write(msg)?;
         receiver.recv().unwrap_or(Ok("".to_string()))
+    }
+
+    pub fn debug(&mut self) {
+        self.debugging = true;
     }
 
     pub fn read(&mut self) -> thread::JoinHandle<()> {
         let conn = self.conn.try_clone().unwrap();
         let tasks = Arc::clone(&self.tasks);
+        let is_debugging = Arc::new(self.debugging);
         thread::spawn(move || {
             let poll = mio::Poll::new().unwrap();
             poll.register(&conn, CLIENT, Ready::readable(), PollOpt::edge())
@@ -66,6 +65,9 @@ impl IngestChan {
                         CLIENT => match reader.read_line(&mut line) {
                             Ok(_) => {
                                 if line.ends_with("\r\n") {
+                                    if *is_debugging {
+                                        println!("Read: {}", line);
+                                    }
                                     if line.starts_with("ERR") {
                                         // TODO: deal error
                                     } else if line.starts_with("CONNECTED") {
@@ -118,6 +120,9 @@ impl IngestChan {
         ),
         Error,
     > {
+        if self.debugging {
+            println!("Write: {}", msg);
+        }
         let (task, (sender, receiver)) = Task::new(msg.clone());
         {
             let mut t = self.tasks.lock().expect("Failed to acquire task lock");
@@ -227,8 +232,9 @@ mod test {
     use super::*;
     use std::time;
     #[test]
-    fn test_search() {
+    fn test_ingest() {
         let mut s = IngestChan::new("127.0.0.1", 1491, "haha").expect("Connection error");
+        s.debug();
         let handle = s.read();
         assert_eq!("CONNECTED <sonic-server v1.1.8>\r\n", s.connect().unwrap());
         thread::sleep(time::Duration::from_secs(4));
