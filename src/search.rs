@@ -68,10 +68,10 @@ impl SearchChan {
     pub fn connect(&mut self) -> Result<String, Error> {
         let msg = format!("START search {}\n", &self.password);
         let (_, receiver) = self.write(msg)?;
-        receiver
-            .recv()
-            .or_else(|e| Err(Error::new(ErrorKind::Other, format!("{:?}", e))))
-            .unwrap()
+        match receiver.recv() {
+            Ok(ret) => ret,
+            Err(e) => Err(Error::new(ErrorKind::Other, format!("{:?}", e)))
+        }
     }
 
     pub fn debug(&mut self) {
@@ -300,6 +300,7 @@ impl SearchChan {
 mod test {
     use super::*;
     use std::time;
+
     #[test]
     fn test_search() {
         let mut s = SearchChan::new("127.0.0.1", 1491, "haha").expect("Connection error");
