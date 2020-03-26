@@ -5,8 +5,9 @@ use std::io::prelude::*;
 use std::io::{BufReader, BufWriter, Error, ErrorKind};
 use std::mem::drop;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 pub struct Task {
     pub msg: String,
@@ -23,13 +24,13 @@ impl Task {
             Receiver<Result<String, Error>>,
         ),
     ) {
-        let (sender, receiver) = sync_channel::<Result<String, Error>>(2);
+        let (sender, receiver) = sync_channel::<Result<String, Error>>(1);
         (
             Task {
                 msg: msg,
                 sender: sender.clone(),
             },
-            (sender, receiver),
+            (sender.clone(), receiver),
         )
     }
 }
@@ -40,6 +41,8 @@ pub struct SearchChan {
     password: String,
     conn: TcpStream,
     search_ids: Arc<Mutex<HashMap<String, SyncSender<Result<String, Error>>>>>,
+    //for serialize execute 'pending' and 'event query' command.
+    condvar: Arc<(Mutex<i32>, Condvar)>,
     tasks: Arc<Mutex<Vec<Task>>>,
     debugging: bool,
 }
@@ -59,6 +62,7 @@ impl SearchChan {
             password: password.clone().into(),
             conn: stream,
             search_ids: Arc::new(Mutex::new(HashMap::new())),
+            condvar: Arc::new((Mutex::new(0), Condvar::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             debugging: false,
         };
@@ -82,78 +86,99 @@ impl SearchChan {
         let conn = self.conn.try_clone().unwrap();
         let tasks = Arc::clone(&self.tasks);
         let search_ids = Arc::clone(&self.search_ids);
+        let condition = Arc::clone(&self.condvar);
         let is_debugging = Arc::new(self.debugging);
         thread::spawn(move || {
             let poll = mio::Poll::new().unwrap();
-            poll.register(&conn, CLIENT, Ready::readable(), PollOpt::edge())
-                .unwrap();
+            poll.register(&conn, CLIENT, Ready::readable(), PollOpt::level());
             let mut events = Events::with_capacity(1024);
             let mut reader = BufReader::new(&conn);
-            let mut line = String::new();
+            //let mut line = String::new();
             'event_loop: loop {
                 poll.poll(&mut events, None).unwrap();
                 for event in events.iter() {
                     match event.token() {
-                        CLIENT => match reader.read_line(&mut line) {
-                            Ok(_) => {
-                                if *is_debugging {
-                                    println!("Read: {}", line);
-                                }
-                                if line.ends_with("\r\n") {
-                                    if line.starts_with("ERR") {
-                                        let mut t = tasks.lock().unwrap();
-                                        if t.len() > 0 {
+                        CLIENT => {
+                            for content in reader.by_ref().lines() {
+                                match content {
+                                    Ok(line) => {
+                                        if *is_debugging {
+                                            println!("Read: {}", line);
+                                        }
+                                        if line.starts_with("ERR") {
+                                            let mut t = tasks.lock().unwrap();
+                                            if t.len() > 0 {
+                                                let task = t.remove(0);
+                                                task.sender
+                                                    .send(Ok(line.clone()))
+                                                    .expect("Failed to send msg err");
+                                            }
+                                        } else if line.starts_with("CONNECTED") {
+                                            let mut t = tasks.lock().unwrap();
+                                            if t.len() > 0 {
+                                                let task = t.remove(0);
+                                                task.sender
+                                                    .send(Ok(line.clone()))
+                                                    .expect("Failed to send msg connected");
+                                            }
+                                        } else if line.starts_with("STARTED") {
+                                            // Do nothing, connection is started after CONNECTED
+                                        } else if line.starts_with("PENDING") {
+                                            let mut t = tasks.lock().unwrap();
+
                                             let task = t.remove(0);
                                             task.sender
                                                 .send(Ok(line.clone()))
-                                                .expect("Failed to send msg err");
+                                                .expect("Failed to send msg pending");
+                                        } else if line.starts_with("EVENT") {
+                                            let tokens = line.split(" ").collect::<Vec<&str>>();
+                                            let id = tokens[2];
+
+                                            let &(ref lock, ref cvar) = &*condition;
+                                            let mut has_data = lock.lock().unwrap();
+                                            loop {
+                                                let ser = cvar
+                                                    .wait_timeout(
+                                                        has_data,
+                                                        Duration::from_millis(100),
+                                                    )
+                                                    .unwrap();
+                                                has_data = ser.0;
+                                                if *has_data >= 1 {
+                                                    break;
+                                                }
+                                            }
+
+                                            let mut ids = search_ids
+                                                .lock()
+                                                .expect("Failed to acquire search_ids lock");
+                                            //println!("search ids num:{},event ok", ids.len());
+                                            if let Some(sender) = ids.remove(id) {
+                                                sender
+                                                    .send(Ok(tokens.join(" ")))
+                                                    .expect("Failed to send event");
+                                            }
+                                        } else {
+                                            let mut t = tasks.lock().unwrap();
+                                            if t.len() > 0 {
+                                                let task = t.remove(0);
+                                                task.sender
+                                                    .send(Ok(line.clone()))
+                                                    .expect("Failed to send msg");
+                                            }
                                         }
-                                        drop(t);
-                                    } else if line.starts_with("CONNECTED") {
-                                        let mut t = tasks.lock().unwrap();
-                                        if t.len() > 0 {
-                                            let task = t.remove(0);
-                                            task.sender
-                                                .send(Ok(line.clone()))
-                                                .expect("Failed to send msg connected");
+                                        if line.starts_with("ENDED") {
+                                            break 'event_loop;
                                         }
-                                        drop(t);
-                                    } else if line.starts_with("STARTED") {
-                                        // Do nothing, connection is started after CONNECTED
-                                    } else if line.starts_with("EVENT") {
-                                        let tokens = line.split(" ").collect::<Vec<&str>>();
-                                        let id = tokens[2];
-                                        let mut ids = search_ids
-                                            .lock()
-                                            .expect("Failed to acquire search_ids lock");
-                                        if let Some(sender) = ids.remove(id) {
-                                            sender
-                                                .send(Ok(tokens.join(" ")))
-                                                .expect("Failed to send event");
-                                        }
-                                        drop(ids);
-                                    } else {
-                                        let mut t = tasks.lock().unwrap();
-                                        if t.len() > 0 {
-                                            let task = t.remove(0);
-                                            task.sender
-                                                .send(Ok(line.clone()))
-                                                .expect("Failed to send msg");
-                                        }
-                                        drop(t);
                                     }
-                                    if line.starts_with("ENDED") {
-                                        break 'event_loop;
+                                    Err(e) => {
+                                        if e.kind() != ErrorKind::WouldBlock {
+                                            println!("{:?}", e);
+                                        }
                                     }
-                                    line = String::new();
                                 }
                             }
-                            Err(e) => {
-                                if e.kind() != ErrorKind::WouldBlock {
-                                    println!("{:?}", e);
-                                }
-                            }
-                        },
+                        }
                         _ => unreachable!(),
                     };
                 }
@@ -183,7 +208,7 @@ impl SearchChan {
         let conn = self.conn.try_clone()?;
         let mut writer = BufWriter::new(conn);
         writer.write_all(msg.as_bytes())?;
-        Ok((sender.clone(), receiver))
+        Ok((sender, receiver))
     }
 
     pub fn query(
@@ -206,7 +231,9 @@ impl SearchChan {
                 .and_then(|l| Some(format!("OFFSET({})", l)))
                 .unwrap_or("".to_string()),
         ))?;
+
         if let Ok(res) = receiver.recv() {
+            println!("recv {:?}", res);
             if let Ok(id) = res {
                 let mut search_ids = self
                     .search_ids
@@ -216,6 +243,13 @@ impl SearchChan {
                     id.split(" ").collect::<Vec<&str>>()[1].trim().to_string(),
                     sender,
                 );
+
+                let &(ref lock, ref cvar) = &*self.condvar;
+                let mut has_data = lock.lock().unwrap();
+                *has_data += 1;
+                cvar.notify_all();
+
+                println!("insert ids num {}", search_ids.len());
                 drop(search_ids);
             }
         }
@@ -305,16 +339,17 @@ mod test {
         let mut s = SearchChan::new("127.0.0.1", 1491, "haha").expect("Connection error");
         s.debug();
         let handle = s.read();
-        assert_eq!("CONNECTED <sonic-server v1.1.8>\r\n", s.connect().unwrap());
-        thread::sleep(time::Duration::from_secs(4));
+        assert_eq!("CONNECTED <sonic-server v1.2.3>", s.connect().unwrap());
+        thread::sleep(time::Duration::from_secs(2));
+        let r2 = s.ping();
         let r1 = s
             .query("helpdesk", "user:0dcde3a6", "gdpr", Some(50), None)
             .unwrap();
-        let r2 = s.ping();
+
         let r3 = s.quit();
         assert_eq!("EVENT", r1[0]);
-        assert_eq!("PONG\r\n", r2.unwrap());
-        assert_eq!("ENDED quit\r\n", r3.unwrap());
+        assert_eq!("PONG", r2.unwrap());
+        assert_eq!("ENDED quit", r3.unwrap());
         handle.join().expect("Failed to wait process");
     }
 }
