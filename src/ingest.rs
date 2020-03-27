@@ -53,7 +53,7 @@ impl IngestChan {
         let is_debugging = Arc::new(self.debugging);
         thread::spawn(move || {
             let poll = mio::Poll::new().unwrap();
-            poll.register(&conn, CLIENT, Ready::readable(), PollOpt::edge())
+            poll.register(&conn, CLIENT, Ready::readable(), PollOpt::level())
                 .unwrap();
             let mut events = Events::with_capacity(1024);
             let mut reader = BufReader::new(&conn);
@@ -236,7 +236,7 @@ mod test {
         let mut s = IngestChan::new("127.0.0.1", 1491, "haha").expect("Connection error");
         s.debug();
         let handle = s.read();
-        assert_eq!("CONNECTED <sonic-server v1.1.8>\r\n", s.connect().unwrap());
+        assert_eq!("CONNECTED <sonic-server v1.2.3>\r\n", s.connect().unwrap());
         thread::sleep(time::Duration::from_secs(4));
         let r1 = s
             .push(
